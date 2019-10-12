@@ -514,7 +514,7 @@ def main():
     args = parser.parse_args()
 
     if not args.input_files and sys.stdin.isatty():
-        parser.error('Please sepcify input files or pass input via stdin')
+        parser.error('Please specify input files or pass input via stdin')
 
     lines = []
 
