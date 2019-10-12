@@ -1,0 +1,9 @@
+
+def calc_sum_to() -> int:
+    a = 0
+    i = 3
+    while i > 0:
+        a = a + 1
+        i = i - 1
+    return a
+

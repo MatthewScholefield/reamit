@@ -12,6 +12,7 @@ from typing import Set
 class Var:
     num_s_regs = 10
     num_t_regs = 10
+    optimize_move = True
 
     def __init__(self, name: str, start_line: int, init_reg: str = None):
         self.name = name
@@ -41,7 +42,7 @@ class Var:
 
     def quantize(self, used_regs: set, line_no: int):
         if self.reg is None:
-            if self.move_dest is not None and \
+            if self.optimize_move and self.move_dest is not None and \
                     self.move_dest.reg and \
                     self.move_dest.never_accessed:
                 self.end_line = max(self.end_line or -1, self.move_dest.start_line)
@@ -63,14 +64,15 @@ class Var:
                     raise RuntimeError('No more t registers available')
             used_regs.add(reg)
             self.reg = reg
-        if self.never_accessed:
+        if self.optimize_move and self.never_accessed:
             if self.move_dest is not None and not self.move_dest.func_call_between and not self.move_dest.fixed:
                 self.move_dest.reg = self.reg
                 self.move_dest.fixed = True
                 self.fixed = True
                 used_regs.add(self.reg)
         if line_no == self.end_line:
-            used_regs.remove(self.reg)
+            if self.reg in used_regs:
+                used_regs.remove(self.reg)
 
     @property
     def never_accessed(self):
@@ -184,6 +186,12 @@ inst_bgez = partial(BranchInst, 'bgez', 2)
 
 
 class AssemblyGenerator:
+    op_to_inst = {
+        ast.Mult: inst_mul,
+        ast.Add: inst_add,
+        ast.Sub: inst_sub
+    }
+
     def __init__(self):
         self.lines = []
         self.in_scope_vars = []  # type: List[Var]
@@ -203,6 +211,8 @@ class AssemblyGenerator:
             for i, arg in enumerate(obj.args.args):
                 gen.lines.append(
                     (inst_assign(gen.reg(Var(arg.arg, gen.cur_line)), Var('', gen.cur_line, 'a' + str(i))), arg))
+
+            gen.lines.append(' ')  # Add a newline
             gen.labels_stack.append((obj.name, obj))
             start_label = '{}:'.format(gen.cur_label)
             for i in obj.body:
@@ -240,8 +250,8 @@ class AssemblyGenerator:
                     if isinstance(var, Var):
                         var.quantize(used_regs, line_no)
                         all_used_regs.add(var.reg)
-
-            middle_lines.append((str(line), comment))
+            if line:
+                middle_lines.append((str(line), comment))
         s_regs = [i for i in all_used_regs if i.startswith('s')]
         saved_regs = s_regs
         if self.called_func:
@@ -258,8 +268,19 @@ class AssemblyGenerator:
 
         end_lines.append(('jr $ra', ''))
         lines = []
+
+        if self.called_func and middle_lines and not middle_lines[0][0].isspace():
+            start_lines.append((' ', ''))
+            start_lines.append((' ', '=== Arguments ==='))
+
         for line, comment in start_lines + middle_lines + end_lines:
             if not line:
+                continue
+            if line.isspace():
+                if comment:
+                    lines.append('\t# ' + comment)
+                else:
+                    lines.append('')
                 continue
             if line.endswith(':'):
                 line = '\n' + line
@@ -290,25 +311,24 @@ class AssemblyGenerator:
             return obj.n
         if isinstance(obj, ast.Call):
             self.called_func = True
-            for i, arg in enumerate(obj.args):
-                self.lines.append((inst_assign(Var('', self.cur_line, 'a' + str(i)), self.resolve_to_val(arg)), arg))
             for i in self.in_scope_vars:
                 i.mark_func_called()
+            for i, arg in enumerate(obj.args):
+                self.lines.append((inst_assign(Var('', self.cur_line, 'a' + str(i)), self.resolve_to_val(arg)), arg))
+
+            self.lines.append(('jal {}'.format(obj.func.id), obj))
+
             var = self.reg(Var('', self.cur_line, 'v0'))
             self._mark_access(var)
-            self.lines.append((inst_assign(self.reg(Var('', self.cur_line)), var), obj))
-            return var
+            out_var = self.reg(Var('', self.cur_line))
+            self.lines.append((inst_assign(out_var, var), obj))
+            return out_var
         if isinstance(obj, ast.BinOp):
             left_val = self.resolve_to_val(obj.left)
             right_val = self.resolve_to_val(obj.right)
-            op_to_inst = {
-                ast.Mult: inst_mul,
-                ast.Add: inst_add,
-                ast.Sub: inst_sub
-            }
-            if type(obj.op) not in op_to_inst:
+            if type(obj.op) not in self.op_to_inst:
                 raise self._err(obj.op, 'Unsupported operator at line {} col {}.')
-            inst = op_to_inst[type(obj.op)]
+            inst = self.op_to_inst[type(obj.op)]
 
             var = self.reg(Var('', self.cur_line))
             self._mark_access(left_val)
@@ -357,6 +377,61 @@ class AssemblyGenerator:
                 var = self.reg(Var(target.id, self.cur_line))
             self.lines.append((inst_assign(var, value), obj))
 
+    def handle_augassign(self, obj: ast.AugAssign):
+        value = self.resolve_to_val(obj.value)
+        target = obj.target
+        if target.id in self.name_to_var:
+            var = self.name_to_var[target.id]
+            if var.func_called and not var.func_call_between:
+                self.in_scope_vars.remove(var)
+                del self.name_to_var[var.name]
+                var = self.reg(Var(var.name, self.cur_line))
+        else:
+            var = self.reg(Var(target.id, self.cur_line))
+        bin_op = ast.BinOp(target, obj.op, value)
+        bin_op.lineno = obj.lineno
+        bin_op.col_offset = obj.col_offset
+        if type(obj.op) not in self.op_to_inst:
+            raise self._err(obj.op, 'Unsupported operator at line {} col {}.')
+        self.lines.append((self.op_to_inst[type(obj.op)](var, var, value), obj))
+
+    def handle_if(self, obj: ast.If):
+        if len(obj.body) == 1:
+            if isinstance(obj.body[0], ast.Continue):
+                self.branch_compare(obj.test, self.cur_label)
+                return
+            elif isinstance(obj.body[0], ast.Return) and obj.body[0].value is None:
+                self.branch_compare(obj.test, self.cur_label + '_end')
+                return
+        end_label = self.cur_label + '_skip_if'
+        self.branch_compare(obj.test, end_label)
+        for i in obj.body:
+            self.interpret(i)
+        self.lines.append(end_label + ':')
+
+    def branch_compare(self, obj: ast.Compare, jump_true_label):
+        op = type(obj.ops[0])
+        left_var = self.resolve_to_val(obj.left)
+        right_var = self.resolve_to_val(obj.comparators[0])
+        if op == ast.Eq:
+            self.lines.append((inst_bne(left_var, right_var, jump_true_label), obj))
+        elif op == ast.NotEq:
+            self.lines.append((inst_beq(left_var, right_var, jump_true_label), obj))
+        else:
+            op_to_inst = {
+                ast.Lt: inst_bgez,
+                ast.LtE: inst_bgtz,
+                ast.Gt: inst_blez,
+                ast.GtE: inst_bltz
+            }
+            if op not in op_to_inst:
+                raise self._err(obj.ops[0], 'Unsupported {} condition at line {} col {}.')
+            bin_op = ast.BinOp(left_var, ast.Sub(), right_var)
+            bin_op.lineno = obj.lineno
+            bin_op.col_offset = obj.col_offset
+            b_minus_a = self.resolve_to_val(bin_op)
+            self.lines.append((op_to_inst[op](b_minus_a, jump_true_label), obj))
+
     def handle_while(self, obj: ast.While):
         if obj.orelse:
             raise self._err(obj.orelse)
@@ -367,27 +442,8 @@ class AssemblyGenerator:
         exp = obj.test
         if not isinstance(exp, ast.Compare) or len(exp.comparators) != 1:
             raise self._err(exp)
-        op = type(exp.ops[0])
-        left_var = self.resolve_to_val(exp.left)
-        right_var = self.resolve_to_val(exp.comparators[0])
-        if op == ast.Eq:
-            self.lines.append((inst_bne(left_var, right_var, end_label), exp))
-        elif op == ast.NotEq:
-            self.lines.append((inst_beq(left_var, right_var, end_label), exp))
-        else:
-            op_to_inst = {
-                ast.Lt: inst_bgez,
-                ast.LtE: inst_bgtz,
-                ast.Gt: inst_blez,
-                ast.GtE: inst_bltz
-            }
-            if op not in op_to_inst:
-                raise self._err(exp.ops[0], 'Unsupported {} condition at line {} col {}.')
-            bin_op = ast.BinOp(left_var, ast.Sub(), right_var)
-            bin_op.lineno = obj.lineno
-            bin_op.col_offset = obj.col_offset
-            b_minus_a = self.resolve_to_val(bin_op)
-            self.lines.append((op_to_inst[op](b_minus_a, end_label), exp))
+
+        self.branch_compare(obj.test, end_label)
 
         for i in obj.body:
             self.interpret(i)
@@ -430,6 +486,8 @@ class AssemblyGenerator:
         val = obj.value
         if isinstance(val, ast.Call):
             self.called_func = True
+            for i in self.in_scope_vars:
+                i.mark_func_called()
             for i, arg in enumerate(val.args):
                 self.lines.append((inst_assign(Var('', self.cur_line, 'a' + str(i)), self.resolve_to_val(arg)), arg))
             self.lines.append(('jal {}'.format(val.func.id), val))
@@ -443,7 +501,9 @@ class AssemblyGenerator:
         ast.Continue: handle_continue,
         ast.Break: handle_break,
         ast.Return: handle_return,
-        ast.Expr: handle_expr
+        ast.Expr: handle_expr,
+        ast.AugAssign: handle_augassign,
+        ast.If: handle_if
     }
 
 
