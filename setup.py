@@ -18,7 +18,7 @@ setup(
     ],
     keywords='reamit',
     packages=['reamit'],
-    install_requires=[],
+    install_requires=['astor'],
     entry_points={
         'console_scripts': [
             'reamit=reamit.__main__:main'
