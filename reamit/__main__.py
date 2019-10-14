@@ -4,16 +4,23 @@ from builtins import reversed
 import ast
 import astor
 from argparse import ArgumentParser
+from enum import Enum
 from typing import List
 from typing import Set
 
 
+class Types(Enum):
+    INTS = 1
+    BYTES = 2
+    INT = 3
+
+
 class Var:
-    num_s_regs = 10
-    num_t_regs = 10
+    num_s_regs = 8
+    num_t_regs = 8
     optimize = True
 
-    def __init__(self, line, reg=None, num=None, name=None):
+    def __init__(self, line, reg=None, num=None, name=None, typ=None):
         self.reg = reg
         self.num = num
         self.name = name
@@ -23,6 +30,15 @@ class Var:
         self.writes = [line]
         self.func_calls = []
         self.expired = False
+        self.typ = typ  # Type info
+
+    def get_byte_offset(self):
+        if not self.typ:
+            raise TypeError()
+        if self.typ == Types.INTS:
+            return 4
+        if self.typ == Types.BYTES:
+            return 1
 
     def write_to(self, dest: 'Var', line: int):
         self.writes_to.append((line, dest))
@@ -139,8 +155,8 @@ class VarContext:
                 val.writes.append(end - 1)
                 val.writes.sort()
 
-    def new(self, line, name='', reg=None, num=None):
-        var = Var(line, reg, num, name=name)
+    def new(self, line, name='', reg=None, num=None, typ=None):
+        var = Var(line, reg, num, name=name, typ=typ)
         self.vals.append(var)
         if name:
             self.names[name] = var
@@ -189,7 +205,7 @@ class Command(AssemblerLine):
             (self.fmt.format(*self.args) if self.fmt else ', '.join(map(str, self.args)))
         ]
         if isinstance(self.obj, ast.AST):
-            parts.append('# ' + astor.to_source(self.obj).strip())
+            parts.append('# ' + astor.to_source(self.obj).strip().replace('\n', ''))
         elif isinstance(self.obj, str):
             parts.append('# ' + self.obj)
         return '\t'.join(parts)
@@ -207,6 +223,14 @@ class Spacer(AssemblerLine):
     pass
 
 
+class GlobalDef(AssemblerLine):
+    def __init__(self, label):
+        self.label = label
+
+    def __str__(self):
+        return '.globl ' + self.label
+
+
 class StackAlloc(AssemblerLine):
     pass
 
@@ -221,6 +245,30 @@ class FuncGenerator:
         self.stack = [VarContext(0)]
         self.new_var('__ra__', reg='ra')
         self.labels_stack = []
+        self.used_labels = set()
+
+    def disambiguate_label(self, identifier, suffix=None):
+        self.labels_stack.append((identifier, None))
+        n = 1
+        while self.cur_label in self.used_labels or (suffix and self.cur_label + suffix in self.used_labels):
+            self.labels_stack.pop()
+            n += 1
+            self.labels_stack.append((identifier + '_' + str(n), None))
+        self.used_labels.add(self.cur_label)
+        if suffix:
+            self.used_labels.add(self.cur_label + suffix)
+        resolved_id = self.labels_stack[-1][0]
+        self.labels_stack.pop()
+        return resolved_id
+
+    def get_label(self, identifier):
+        return self.cur_label + self.disambiguate_label(identifier)
+
+    def push_label(self, obj, identifier, suffix):
+        self.labels_stack.append((self.disambiguate_label(identifier, suffix), obj))
+
+    def pop_label(self):
+        self.labels_stack.pop()
 
     @classmethod
     def generate(cls, source: str, filename: str = '<unknown>') -> list:
@@ -237,12 +285,21 @@ class FuncGenerator:
 
             gen = cls()
             gen.add(Spacer())
-            gen.labels_stack.append((obj.name, obj))
+            gen.add(GlobalDef(obj.name))
+            gen.push_label(obj, obj.name, '_end')
             gen.add(Label(gen.cur_label))
             gen.add(StackAlloc())
             gen.add(Spacer())
             for i, arg in enumerate(obj.args.args):
-                gen.assign(gen.new_var(arg.arg), gen.new_var(reg='a' + str(i)), obj=arg)
+                t = arg.annotation
+                typ = None
+                if isinstance(t, ast.Name):
+                    label = t.id
+                    name_to_typ = {'ints': Types.INTS, 'bytes': Types.BYTES, 'int': Types.INT}
+                    if label not in name_to_typ:
+                        raise gen._err(arg, 'No such type {} (line {} col {}).')
+                    typ = name_to_typ[label]
+                gen.assign(gen.new_var(arg.arg, typ=typ), gen.new_var(reg='a' + str(i)), obj=arg)
             gen.add(Spacer())
             for i in obj.body:
                 gen.interpret(i)
@@ -251,7 +308,7 @@ class FuncGenerator:
             gen.add(Label(gen.cur_label + '_end'))
             gen.add(StackDealloc())
             gen.inst('jr', gen.ctx['__ra__'])
-            gen.labels_stack.pop()
+            gen.pop_label()
             assembly_lines.extend(gen.quantize_lines())
         assembly_lines.append('')
         return assembly_lines
@@ -278,7 +335,7 @@ class FuncGenerator:
                 if line.still_useful:
                     lines.append(str(line))
                     last_line = Command
-            if isinstance(line, Label):
+            elif isinstance(line, Label):
                 lines.append('')
                 lines.append(str(line))
                 last_line = Label
@@ -298,6 +355,10 @@ class FuncGenerator:
                         lines.append(str(Command('lw', '$' + reg, i * 4, fmt='{}, {}($sp)')))
                     lines.append(str(Command('add', '$sp', 4 * len(saved_regs), obj='Deallocate stack')))
                     last_line = Command
+            elif isinstance(line, AssemblerLine):
+                lines.append(str(line))
+            else:
+                raise RuntimeError('Unknown type in lines')
         return lines
 
     @property
@@ -314,10 +375,10 @@ class FuncGenerator:
 
     @staticmethod
     def _err(obj, msg='Unsupported {} syntax at line {} col {}.') -> SyntaxError:
-        return SyntaxError(msg.format(type(obj).__name__, obj.lineno, obj.col_offset))
+        return SyntaxError(msg.format(type(obj).__name__, getattr(obj, 'lineno', '?'), getattr(obj, 'col_offset', '?')))
 
-    def new_var(self, name='', reg=None, num=None) -> Var:
-        return self.ctx.new(self.cur_line, name, reg, num)
+    def new_var(self, name='', reg=None, num=None, typ=None) -> Var:
+        return self.ctx.new(self.cur_line, name, reg, num, typ=typ)
 
     def push_stack(self):
         self.stack.append(VarContext(self.cur_line))
@@ -339,15 +400,86 @@ class FuncGenerator:
                     raise self._err(target.slice)
                 array = self.resolve(target.value)
                 index = self.resolve(target.slice.value)
-                if index.num is not None:
-                    self.inst('lw', value, index, array, fmt='{}, {}({})', reads=[index, array], writes=[value],
-                              obj=obj)
-                else:
-                    offset = self.new_var()
-                    self.assign(offset, array, obj)
-                    self.inst('add', offset, offset, index, reads=[offset, index], writes=[offset], obj=obj)
-                    self.inst('lw', value, 0, offset, reads=[offset], writes=[value], fmt='{}, {}({})', obj=obj)
+                try:
+                    offs = array.get_byte_offset()
+                    typ = array.typ
+                    inst = {Types.INTS: 'lw', Types.BYTES: 'lb'}[typ]
+                    if index.num is not None:
+                        self.inst(inst, value, self.new_var(num=offs * index.num), array, fmt='{}, {}({})', reads=[index, array], writes=[value],
+                                  obj=obj)
+                    else:
+                        offset = self.new_var()
+                        self.assign(offset, index, obj)
+                        byte_mul = self.new_var(num=offs)
+                        self.inst('mul', offset, offset, byte_mul, reads=[byte_mul, offset], writes=[offset])
+                        self.inst('add', offset, offset, array, reads=[offset, array], writes=[offset], obj=obj)
+                        self.inst(inst, value, 0, offset, reads=[offset], writes=[value], fmt='{}, {}({})', obj=obj)
+                except TypeError as e:
+                    raise self._err(obj, 'No type defined for {} variable (line {} col {}).') from e
                 return value
+            if isinstance(obj, ast.Str):
+                if len(obj.s) != 1:
+                    raise self._err(obj, 'Strings are not supported. Only char constants are allowed (line {} col {})')
+                return self.new_var(num=ord(obj.s))
+            if isinstance(obj, ast.NameConstant):
+                if not obj in [True, False, None]:
+                    raise self._err(obj, 'Unsupported constant {} (line {} col {}).')
+                return self.new_var(num=1 if obj.value else 0)
+            if isinstance(obj, ast.BoolOp):
+                op = type(obj.op)
+                if not all(type(i) in [ast.Compare, ast.NameConstant] for i in obj.values):
+                    raise self._err(obj, 'Unsupported {} expression in boolean expression (line {} col {}).')
+                exp = obj.values[0]
+                for value in obj.values[1:]:
+                    exp = ast.BinOp(exp, {ast.Or: ast.BitOr, ast.And: ast.BitAnd}[op](), value)
+                return self.resolve(exp)
+            if isinstance(obj, ast.Compare):
+                left = self.resolve(obj.left)
+                right = self.resolve(obj.comparators[0])
+                if left.num is not None and right.num is not None:
+                    exp = ast.Expression(ast.BinOp(ast.Num(left.num), obj.op, ast.Num(right.num)))
+                    return self.new_var(num=eval(compile(exp, '', mode='eval')))
+
+                op = type(obj.ops[0])
+                invert_output = False
+                if left.num is not None:
+                    left, right = right, left
+                    op = {ast.Lt: ast.Gt, ast.LtE: ast.GtE, ast.Eq: ast.Eq, ast.NotEq: ast.NotEq}[op]
+
+                if right.num is not None:
+                    if op == ast.GtE:
+                        invert_output = True
+                        op = ast.Lt
+                    if op == ast.Gt:
+                        invert_output = True
+                        op = ast.LtE
+                    if op == ast.LtE:
+                        right = self.new_var(num=right.num + 1)
+                        op = ast.Lt
+
+                if op == ast.Gt:
+                    inst = 'sgt'
+                elif op == ast.GtE:
+                    inst = 'sge'
+                elif op == ast.Lt:
+                    inst = 'slt' if right.num is None else 'slti'
+                elif op == ast.LtE:
+                    inst = 'sle'
+                elif op == ast.Eq:
+                    inst = 'seq'
+                    if right.num is not None:
+                        new_right = self.new_var()
+                        self.assign(new_right, right, obj=obj)
+                elif op == ast.NotEq:
+                    inst = 'sne'
+                else:
+                    raise self._err(obj)
+
+                out = self.new_var()
+                self.inst(inst, out, left, right, reads=[left, right], writes=[out], obj=obj)
+                if invert_output:
+                    self.inst('xori', out, out, 1, reads=[out], writes=[out], obj=obj)
+                return out
             if isinstance(obj, ast.Num):
                 return self.new_var(num=obj.n)
             if isinstance(obj, ast.Call):
@@ -361,22 +493,64 @@ class FuncGenerator:
                 out_var = self.new_var()
                 self.assign(out_var, return_var, obj=obj)
                 return out_var
+            if isinstance(obj, ast.UnaryOp):
+                op = obj.op
+                target = self.resolve(obj.operand)
+                if target.num is not None:
+                    opera =  ast.Num(target.num)
+                    opera.lineno = 0
+                    opera.col_offset = 0
+                    op = ast.UnaryOp(op, opera)
+                    op.lineno = 0
+                    op.col_offset = 0
+                    exp = ast.Expression(op)
+                    exp.lineno = 0
+                    code = compile(exp, '', mode='eval')
+                    return self.new_var(num=eval(code))
+                if isinstance(op, ast.USub):
+                    var = self.new_var()
+                    var.typ = target.typ
+                    self.inst('mul', var, target, self.new_var(num=-1), reads=[target], writes=[var])
+                elif isinstance(op, ast.Invert):
+                    var = self.new_var()
+                    var.typ = target.typ
+                    self.inst('nor', var, target, target, reads=[target], writes=[var])
+                elif isinstance(op, ast.UAdd):
+                    var = target
+                else:
+                    raise self._err(op, 'Unsupported unary operationr {} (line {} col {})')
+                return var
             if isinstance(obj, ast.BinOp):
                 left_val = self.resolve(obj.left)
                 right_val = self.resolve(obj.right)
                 op_to_inst = {
-                    ast.Mult: 'mul',
-                    ast.Add: 'add',
-                    ast.Sub: 'sub'
+                    ast.Mult: ('mul', 'mul'),
+                    ast.Add: ('add', 'addi'),
+                    ast.Sub: ('sub', 'sub'),
+                    ast.BitAnd: ('and', 'andi'),
+                    ast.BitOr: ('or', 'ori'),
+                    ast.BitXor: ('xor', 'xori'),
+                    ast.RShift: ('srl', 'srl'),
+                    ast.LShift: ('sllv', 'sll')
                 }
+                var = self.new_var()
+                inst, im_inst = op_to_inst[type(obj.op)]
+
+                if left_val.num is not None and right_val.num is not None:
+                    exp = ast.Expression(ast.BinOp(ast.Num(left_val.num), obj.op, ast.Num(right_val.num)))
+                    return self.new_var(num=eval(compile(exp, '', mode='eval')))
+                if left_val.num is not None:
+                    if inst in ['sub', 'srv', 'sllv']:
+                        old_num = left_val
+                        left_val = self.new_var()
+                        self.assign(left_val, old_num)
+                    else:
+                        left_val, right_val = right_val, left_val
                 if type(obj.op) not in op_to_inst:
                     raise self._err(obj.op, 'Unsupported operator {} at line {} col {}.')
-                if isinstance(left_val, int):
-                    raise self._err(obj.left, 'Numeric constant on left site unsupported (line {1} col {2})')
 
-                var = self.new_var()
-                inst = op_to_inst[type(obj.op)]
-                self.inst(inst, var, left_val, right_val, reads=[left_val, right_val], writes=[var], obj=obj)
+                var.typ = var.typ or left_val.typ or right_val.typ
+                self.inst(inst, var, left_val, right_val, reads=[left_val, right_val], writes=[var], obj=obj, imm=(im_inst, right_val))
                 return var
             if isinstance(obj, ast.Name):
                 for ctx in reversed(self.stack):
@@ -424,14 +598,23 @@ class FuncGenerator:
                 raise self._err(target.slice)
             array = self.resolve(target.value)
             index = self.resolve(target.slice.value)
-            if index.num is not None:
-                self.inst('sw', value, index, array, fmt='{}, {}({})', reads=[value, index, array], writes=[],
-                          obj=obj)
-            else:
-                offset = self.new_var()
-                self.assign(offset, array, obj)
-                self.inst('add', offset, offset, index, reads=[offset, index], writes=[offset], obj=obj)
-                self.inst('sw', value, 0, offset, reads=[value, offset], writes=[], fmt='{}, {}({})', obj=obj)
+            try:
+                offs = array.get_byte_offset()
+                typ = array.typ
+                inst = {Types.INTS: 'sw', Types.BYTES: 'sb'}[typ]
+                if index.num is not None:
+                    byt_of = self.new_var(num=index.num * offs)
+                    self.inst(inst, value, byt_of, array, fmt='{}, {}({})', reads=[value, byt_of, array], writes=[],
+                              obj=obj)
+                else:
+                    offset = self.new_var()
+                    self.assign(offset, index, obj)
+                    byt_mul = self.new_var(num=offs)
+                    self.inst('mul', offset, offset, byt_mul, reads=[offset, byt_mul], writes=[offset], obj=obj)
+                    self.inst('add', offset, offset, array, reads=[offset, index], writes=[offset], obj=obj)
+                    self.inst(inst, value, 0, offset, reads=[value, offset], writes=[], fmt='{}, {}({})', obj=obj)
+            except TypeError as e:
+                raise self._err(obj, 'No type defined for {} variable (line {} col {}).') from e
         else:
             raise self._err(target)
 
@@ -447,36 +630,53 @@ class FuncGenerator:
         if len(obj.body) == 1:
             statm = obj.body[0]
             if isinstance(statm, ast.Continue):
-                self.branch_compare(obj.test, self.cur_label)
+                self.branch_compare(obj.test, self.cur_label, True)
                 return
             elif isinstance(statm, ast.Return) and obj.body[0].value is None:
-                self.branch_compare(obj.test, self.cur_label + '_end')
+                self.branch_compare(obj.test, self.cur_label + '_end', True)
                 return
-        end_label = self.cur_label + '_skip_if'
-        self.branch_compare(obj.test, end_label)
+        end_label = self.get_label('_skip_if')
+        self.branch_compare(obj.test, end_label, False)
         for i in obj.body:
             self.interpret(i)
         self.add(Label(end_label))
 
-    def branch_compare(self, obj: ast.Compare, jump_true_label):
+    def branch_compare(self, obj: ast.AST, jump_label, jump_condition):
+        if not isinstance(obj, ast.Compare):
+            val = self.resolve(obj)
+            self.inst('bnez' if jump_condition else 'beqz', val, jump_label, reads=[val], obj=obj)
+            return
         op = type(obj.ops[0])
         left_var = self.resolve(obj.left)
         right_var = self.resolve(obj.comparators[0])
-        eq_op_to_inst = {
-            ast.Eq: 'bne',
-            ast.NotEq: 'beq'
-        }
-        cp_op_to_inst = {
-            ast.Lt: 'bgez',
-            ast.LtE: 'bgtz',
-            ast.Gt: 'blez',
-            ast.GtE: 'bltz'
-        }
+
+        if jump_condition:
+            eq_op_to_inst = {
+                ast.Eq: 'beq',
+                ast.NotEq: 'bne'
+            }
+            cp_op_to_inst = {
+                ast.Lt: 'bltz',
+                ast.LtE: 'blez',
+                ast.Gt: 'bgtz',
+                ast.GtE: 'bgez'
+            }
+        else:
+            eq_op_to_inst = {
+                ast.Eq: 'bne',
+                ast.NotEq: 'beq'
+            }
+            cp_op_to_inst = {
+                ast.Lt: 'bgez',
+                ast.LtE: 'bgtz',
+                ast.Gt: 'blez',
+                ast.GtE: 'bltz'
+            }
         if op in eq_op_to_inst:
-            self.inst(eq_op_to_inst[op], left_var, right_var, jump_true_label, reads=[left_var, right_var], obj=obj)
+            self.inst(eq_op_to_inst[op], left_var, right_var, jump_label, reads=[left_var, right_var], obj=obj)
         elif op in cp_op_to_inst:
-            b_minus_a = self.resolve(ast.BinOp(obj.left, ast.Sub(), obj.comparators[0]))
-            self.inst(cp_op_to_inst[op], b_minus_a, jump_true_label, reads=[b_minus_a], writes=[], obj=obj)
+            a_minus_b = self.resolve(ast.BinOp(obj.left, ast.Sub(), obj.comparators[0]))
+            self.inst(cp_op_to_inst[op], a_minus_b, jump_label, reads=[a_minus_b], writes=[], obj=obj)
         else:
             raise self._err(obj.ops[0], 'Unsupported {} condition at line {} col {}.')
 
@@ -484,7 +684,7 @@ class FuncGenerator:
         if obj.orelse:
             raise self._err(obj.orelse)
         self.push_stack()
-        self.labels_stack.append(('while', obj))
+        self.push_label(obj, 'while', '_end')
         label = self.cur_label
         end_label = label + '_end'
         self.add(Label(label))
@@ -492,14 +692,14 @@ class FuncGenerator:
         if not isinstance(exp, ast.Compare) or len(exp.comparators) != 1:
             raise self._err(exp)
 
-        self.branch_compare(exp, end_label)
+        self.branch_compare(exp, end_label, False)
 
         for i in obj.body:
             self.interpret(i)
 
         self.inst('j', label, reads=[], writes=[])
         self.add(Label(end_label))
-        self.labels_stack.pop()
+        self.pop_label()
         self.pop_stack(True)
 
     @property
