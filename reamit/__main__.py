@@ -31,6 +31,7 @@ class Var:
         self.func_calls = []
         self.expired = False
         self.typ = typ  # Type info
+        self.linked = None
 
     def get_byte_offset(self):
         if not self.typ:
@@ -78,7 +79,16 @@ class Var:
         return float('inf')
 
     def merge_onto(self, other):
-        other.reg = self.reg
+        other.linked = self
+        elem_to_self_writes_to = {elem: (line, elem) for line, elem in self.writes_to}
+
+        if other in elem_to_self_writes_to:
+            line, _ = elem_to_self_writes_to[other]
+            self.writes_to.remove((line, other))
+            other.writes_from.remove((line, self))
+            self.reads.remove(line)
+            other.writes.remove(line)
+
         other.writes = self.writes = sorted(self.writes + other.writes)
         other.reads = self.reads = sorted(self.reads + other.reads)
         other.func_calls = self.func_calls = sorted(self.func_calls + other.func_calls)
@@ -86,21 +96,24 @@ class Var:
     def quantize(self, used_regs: set, line_no: int):
         if self.num is not None:
             return
-        if self.optimize and self.reg is None and len(self.writes_from) == 1:
+        if self.linked:
+            return
+        if self.optimize and self.reg is None and len(self.writes_from) >= 1:
             move_line, src = self.writes_from[0]
             born_from_move = self.writes[0] == move_line
-            if born_from_move and not src.expired and src.reg is not None and len(self.writes) == 1 and (
+            if born_from_move and not src.expired and (len(self.writes_from) == 1 or len(src.reads) == 1) and (
                     not self.reads or src.find_write_before(max(self.reads)) <= move_line) and (
                     src.is_func_immune or not self.is_func_immune):
                 src.merge_onto(self)
+                return
 
         if self.optimize and self.reg is None and len(self.writes_to) == 1:
             move_line, dest = self.writes_to[0]
             killed_from_move = max(self.reads) == move_line
-            if killed_from_move and not dest.expired and dest.reg is not None and len(
-                    self.reads) == 1 and dest.find_read_after(self.writes[0]) >= move_line and (
+            if killed_from_move and not dest.expired and dest.find_read_after(self.writes[0]) >= move_line and (
                     dest.is_func_immune or not self.is_func_immune):
                 dest.merge_onto(self)
+                return
 
         if self.reg is None:
             if self.is_func_immune:
@@ -128,6 +141,8 @@ class Var:
     def __str__(self):
         if self.num is not None:
             return str(self.num)
+        if self.linked:
+            return str(self.linked)
         if self.reg is None:
             return '<Var {}>'.format(id(self) % 1000)
         else:
@@ -325,6 +340,11 @@ class FuncGenerator:
                 for var in line.reads + line.writes:
                     if var.reg:
                         all_used_regs.add(var.reg)
+
+        print('=== Raw Commands ===')
+        print('\n'.join('{}: {}'.format(i, line) for i, line in enumerate(self.lines)))
+        print()
+
         s_regs = [i for i in all_used_regs if i.startswith('s')]
         saved_regs = ['ra'] * bool(self.ctx['__ra__'].func_calls) + s_regs
 
