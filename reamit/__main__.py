@@ -100,6 +100,22 @@ class Var:
         other.reads = self.reads = sorted(self.reads + other.reads)
         other.func_calls = self.func_calls = sorted(self.func_calls + other.func_calls)
 
+    def get_candidate(self, used_regs):
+        if self.is_func_immune:
+            for i in range(self.num_s_regs):
+                reg = 's' + str(i)
+                if reg not in used_regs:
+                    return reg
+            else:
+                raise RuntimeError('No more s registers available.')
+        else:
+            for i in range(self.num_t_regs):
+                reg = 't' + str(i)
+                if reg not in used_regs:
+                    return reg
+            else:
+                raise RuntimeError('No more t registers available')
+
     def quantize(self, used_regs: set, line_no: int):
         if self.num is not None:
             return
@@ -108,38 +124,50 @@ class Var:
         if self.optimize_level >= 1 and self.reg is None and (
                 ((len(self.writes_from) == 1) and (self.optimize_level == 1)) or
                 ((len(self.writes_from) >= 1) and (self.optimize_level > 1))
-                ):
+        ):
             move_line, src = self.writes_from[0]
             born_from_move = self.writes[0] == move_line
-            if born_from_move and not src.expired and (len(self.writes_from) == 1 or len(src.reads) == 1) and (
-                    not self.reads or src.find_write_before(max(self.reads)) <= move_line) and (
-                    src.is_func_immune or not self.is_func_immune):
+            if (
+                    born_from_move and
+                    not src.expired and
+                    src.lnk.reg is not None and
+                    (
+                            len(self.writes_from) == 1 or
+                            len(src.reads) == 1
+                    ) and
+                    (
+                            not self.reads or
+                            src.find_write_before(max(self.reads)) <= move_line
+                    ) and
+                    (
+                            src.is_func_immune or
+                            not self.is_func_immune
+                    )
+            ):
                 src.merge_onto(self)
                 return
 
         if self.optimize_level >= 1 and self.reg is None and len(self.writes_to) == 1:
             move_line, dest = self.writes_to[0]
             killed_from_move = max(self.reads) == move_line
-            if killed_from_move and not dest.expired and ((self.optimize_level == 1 and dest.reg is not None) or self.optimize_level > 1) and dest.find_read_after(self.writes[0]) >= move_line and (
-                    dest.is_func_immune or not self.is_func_immune):
+            if (
+                    killed_from_move and
+                    not dest.expired and
+                    (
+                            (self.optimize_level == 1 and dest.lnk.reg is not None) or
+                            self.optimize_level > 1
+                    ) and
+                    dest.find_read_after(self.writes[0]) >= move_line and
+                    (
+                            dest.is_func_immune or
+                            not self.is_func_immune
+                    )
+            ):
                 dest.merge_onto(self)
                 return
 
         if self.reg is None:
-            if self.is_func_immune:
-                for i in range(self.num_s_regs):
-                    reg = 's' + str(i)
-                    if reg not in used_regs:
-                        break
-                else:
-                    raise RuntimeError('No more s registers available.')
-            else:
-                for i in range(self.num_t_regs):
-                    reg = 't' + str(i)
-                    if reg not in used_regs:
-                        break
-                else:
-                    raise RuntimeError('No more t registers available')
+            reg = self.get_candidate(used_regs)
             used_regs.add(reg)
             self.reg = reg
 
@@ -208,11 +236,24 @@ class Command(AssemblerLine):
         self.reads = reads or []
         self.writes = writes or []
 
-    def get_comment(self):
-        return '# ' + astor.to_source(self.obj).strip() if self.obj else ''
+    def get_comment(self) -> str:
+        if isinstance(self.obj, ast.AST):
+            return astor.to_source(self.obj).strip().split('\n')[0]
+        elif isinstance(self.obj, str):
+            return self.obj
+        else:
+            return ''
+
+    def is_linked_to(self, other: 'Command') -> bool:
+        return (
+                (len(other.writes) == 1 and other.writes[0] in self.reads) or
+                (len(self.writes) == 1 and self.writes[0] in other.reads)
+        )
 
     @property
     def still_useful(self):
+        if self.inst == 'nop':
+            return False
         if self.inst != 'move':
             return True
         dest, src = self.args
@@ -222,12 +263,21 @@ class Command(AssemblerLine):
         extra_commands = []
         mapping = {}
         for var in self.reads:
-            if var.lnk.num is not None and (not self.imm or var.lnk is not self.imm[1].lnk):
+            if var.lnk.num == 0 and (not self.imm or var.lnk is not self.imm[1].lnk):
+                mapping[var] = Var(var.writes[0], reg='0')
+            elif var.lnk.num is not None and (not self.imm or var.lnk is not self.imm[1].lnk):
                 r = Var(var.writes[0])
                 mapping[var] = r
                 extra_commands += [Command('li', r, var, writes=[r], reads=[var])]
         self.args = [mapping.get(arg, arg) for arg in self.args]
         return extra_commands
+
+    def absorb_line(self, line: 'Command'):
+        """Takes comment from another line if useful"""
+        if self.is_linked_to(line) or line.inst == 'nop':
+            self.obj = line.obj
+            return True
+        return False
 
     def __str__(self):
         inst = self.inst
@@ -235,15 +285,12 @@ class Command(AssemblerLine):
             im_inst, var = self.imm
             if var.num is not None:
                 inst = im_inst
+        comment = self.get_comment()
         parts = [
             '',
             inst,
             (self.fmt.format(*self.args) if self.fmt else ', '.join(map(str, self.args)))
-        ]
-        if isinstance(self.obj, ast.AST):
-            parts.append('# ' + astor.to_source(self.obj).strip().replace('\n', ''))
-        elif isinstance(self.obj, str):
-            parts.append('# ' + self.obj)
+        ] + ['# ' + comment] * bool(comment)
         return '\t'.join(parts)
 
 
@@ -440,11 +487,15 @@ class FuncGenerator:
 
         lines = []
         last_line = None
-        for line in self.lines:
+        for i, line in enumerate(self.lines):
             if isinstance(line, Command):
                 if line.still_useful:
                     lines.append(str(line))
                     last_line = Command
+                elif line.obj:
+                    if isinstance(self.lines[i - 1], Command) and self.lines[i - 1].absorb_line(line):
+                        lines[-1] = str(self.lines[i - 1])
+                        self.lines[i] = None
             elif isinstance(line, Label):
                 if last_line != GlobalDef:
                     lines.append('')
@@ -783,7 +834,7 @@ class FuncGenerator:
             self.assign_target(target, read_var, obj)
 
     def handle_augassign(self, obj: ast.AugAssign):
-        self.assign_target(obj.target, self.resolve(ast.BinOp(obj.target, obj.op, obj.value)))
+        self.assign_target(obj.target, self.resolve(ast.BinOp(obj.target, obj.op, obj.value)), obj)
 
     def handle_if(self, obj: ast.If):
         if len(obj.body) == 1:
@@ -796,6 +847,7 @@ class FuncGenerator:
                 return
         end_label = self.get_label('_skip_if')
         self.branch_compare(obj.test, end_label, False)
+        self.mark_obj(obj)
         for i in obj.body:
             self.interpret(i)
         self.add(Label(end_label))
@@ -839,6 +891,10 @@ class FuncGenerator:
         else:
             raise self._err(obj.ops[0], 'Unsupported {} condition at line {} col {}.')
 
+    def mark_obj(self, obj: ast.AST):
+        """Provides a more accurate object marker for the last command"""
+        self.inst('nop', reads=self.lines[-1].writes, obj=obj)
+
     def handle_while(self, obj: ast.While):
         if obj.orelse:
             raise self._err(obj.orelse)
@@ -852,6 +908,7 @@ class FuncGenerator:
             raise self._err(exp)
 
         self.branch_compare(exp, end_label, False)
+        self.mark_obj(obj)
 
         for i in obj.body:
             self.interpret(i)
@@ -889,7 +946,7 @@ class FuncGenerator:
         if obj.value:
             expr_val = self.resolve(obj.value)
             return_var = self.new_var(reg='v0')
-            self.assign(return_var, expr_val)
+            self.assign(return_var, expr_val, obj)
         self.inst('j', parent_func_label + '_end', obj=obj)
 
     def handle_expr(self, obj: ast.Expr):
