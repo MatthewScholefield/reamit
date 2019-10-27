@@ -515,7 +515,7 @@ class FuncGenerator:
                 if saved_regs:
                     for i, reg in reversed(list(enumerate(sorted(saved_regs)))):
                         lines.append(str(Command('lw', '$' + reg, i * 4, fmt='{}, {}($sp)')))
-                    lines.append(str(Command('add', '$sp', 4 * len(saved_regs), obj='Deallocate stack')))
+                    lines.append(str(Command('addi', '$sp', 4 * len(saved_regs), obj='Deallocate stack')))
                     last_line = Command
             elif isinstance(line, AssemblerLine):
                 lines.append(str(line))
@@ -593,8 +593,8 @@ class FuncGenerator:
                     if index is not None:
                         self.assign(offset, index, obj)
                         byte_mul = self.new_var(num=offs)
-                        self.inst('mul', offset, offset, byte_mul, reads=[byte_mul, offset], writes=[offset])
-                        self.inst('add', offset, offset, array, reads=[offset, array], writes=[offset], obj=obj)
+                        self.inst('mul', offset, offset, byte_mul, reads=[byte_mul, offset], writes=[offset], imm=('mul', byte_mul))
+                        self.inst('add', offset, offset, array, reads=[offset, array], writes=[offset], obj=obj, imm=('addi', array))
                         memloc = offset
                     else:
                         memloc = array
@@ -705,11 +705,12 @@ class FuncGenerator:
                 if isinstance(op, ast.USub):
                     var = self.new_var()
                     var.typ = target.typ
-                    self.inst('mul', var, target, self.new_var(num=-1), reads=[target], writes=[var])
+                    v = self.new_var(num=-1)
+                    self.inst('mul', var, target, v, reads=[target], writes=[var], imm=('mul', v))
                 elif isinstance(op, ast.Invert):
                     var = self.new_var()
                     var.typ = target.typ
-                    self.inst('nor', var, target, target, reads=[target], writes=[var])
+                    self.inst('not', var, target, reads=[target], writes=[var], imm=('not', target))
                 elif isinstance(op, ast.UAdd):
                     var = target
                 else:
@@ -764,10 +765,10 @@ class FuncGenerator:
         if inst in ['sub', 'add'] and args[2].num == 0:
             self.assign(args[0], args[1], obj)
             return
-        if inst == 'mul' and args[2].num == '1':
+        if inst == 'mul' and args[2].num == 1:
             self.assign(args[0], args[1], obj)
             return
-        if inst == 'mul' and args[2].num == '0':
+        if inst == 'mul' and args[2].num == 0:
             self.assign(args[0], self.new_var(num=0))
             return
 
@@ -819,8 +820,8 @@ class FuncGenerator:
                     offset = self.new_var()
                     self.assign(offset, index, obj)
                     byt_mul = self.new_var(num=offs)
-                    self.inst('mul', offset, offset, byt_mul, reads=[offset, byt_mul], writes=[offset], obj=obj)
-                    self.inst('add', offset, offset, array, reads=[offset, index], writes=[offset], obj=obj)
+                    self.inst('mul', offset, offset, byt_mul, reads=[offset, byt_mul], writes=[offset], obj=obj, imm=('mul', byt_mul))
+                    self.inst('add', offset, offset, array, reads=[offset, index], writes=[offset], obj=obj, imm=('addi', array))
                     memloc = offset
                 else:
                     memloc = array
