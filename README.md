@@ -89,5 +89,44 @@ factorial_end:
 	lw	$s0, 4($sp)
 	lw	$ra, 0($sp)
 	add	$sp, 8	# Deallocate stack
-	jr	$ra
+	jr	$rap
 ```
+
+
+## Language
+
+The language works as follows:
+
+ - A file consists only of a series of functions
+ - A function contains arguments and a single return value
+ - Any external functions that you want to use can be declared at the top of the file like `some_func = ...`
+ - Pointers to arrays can be declared as the type `ints` or `bytes` (half words not supported)
+
+## Example Code
+
+```python
+
+# Define external function to be called
+external_func = ...
+print_char = ...
+
+# Optionally, define symbols that aren't default in normal Python
+ints = ...
+bytes = ...
+
+def process_data(data: ints, length):
+    i = 0
+    total = 0
+    while i < length:
+        val = external_func(data[i])
+        total += val
+        data[i] = val
+        i += 1
+    print_char('d')
+    print_char('o')
+    print_char('n')
+    print_char('e')
+    print_char('\n')
+    return total
+```
+
